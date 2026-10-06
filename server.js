@@ -2,8 +2,10 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
+app.set('trust proxy', 1);
 const PORT = process.env.PORT || 3000;
 const CONFIG_FILE = path.join(__dirname, 'server-config.json');
 
@@ -101,8 +103,110 @@ function posToLatLng(pos) {
   return { lat, lng, grid };
 }
 
-// Current logged in user state (default: null / unlinked guest for release)
-let currentSession = null;
+// ==================== MULTI-USER SESSION MANAGER ====================
+// Mỗi người dùng có Cookie/Session Token riêng biệt - Không bao giờ bị trùng tài khoản!
+const SESSIONS_FILE = path.join(__dirname, 'sessions.json');
+let userSessions = {};
+
+function loadSessions() {
+  try {
+    if (fs.existsSync(SESSIONS_FILE)) {
+      userSessions = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
+    }
+  } catch (e) {
+    userSessions = {};
+  }
+}
+loadSessions();
+
+function saveSessions() {
+  try {
+    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(userSessions, null, 2), 'utf8');
+  } catch (e) {}
+}
+
+function parseCookies(cookieHeader) {
+  const list = {};
+  if (!cookieHeader) return list;
+  cookieHeader.split(';').forEach(cookie => {
+    let [name, ...rest] = cookie.split('=');
+    name = name?.trim();
+    if (!name) return;
+    const value = rest.join('=').trim();
+    list[name] = decodeURIComponent(value);
+  });
+  return list;
+}
+
+function getUserSession(req) {
+  if (!req) return null;
+  const cookies = parseCookies(req.headers && req.headers.cookie);
+  const token = (cookies && cookies['st25_session']) || (req.headers && req.headers['x-session-token']) || (req.query && req.query.sessionToken);
+  if (token && userSessions[token]) {
+    const s = userSessions[token];
+    if (s.expires_at && s.expires_at < Date.now()) {
+      delete userSessions[token];
+      saveSessions();
+      return null;
+    }
+    return s;
+  }
+  return null;
+}
+
+// Helper: Link player by SteamID from IslePilot API
+async function createPlayerSession(steamId, customName = null) {
+  const pilotPlayer = await callIslePilot(`/players/${steamId}`);
+
+  let persona = customName;
+  let dino = null;
+  let avatar = "https://avatars.steamstatic.com/fef49e7fa7e1997310d705b2a6158ff8dc1cdfeb_full.jpg";
+  let discord = null;
+  let playtime = 0;
+  let wallet = 0;
+
+  if (pilotPlayer) {
+    persona = pilotPlayer.name || persona || `Player_${steamId.slice(-4)}`;
+    avatar = pilotPlayer.avatar || avatar;
+    discord = pilotPlayer.discord || null;
+    playtime = Math.round((pilotPlayer.totalPlaySec || 0) / 3600);
+    wallet = (pilotPlayer.wallet && pilotPlayer.wallet.balance) || 0;
+
+    if (pilotPlayer.species) {
+      const loc = posToLatLng(pilotPlayer.position);
+      dino = {
+        species: pilotPlayer.species,
+        gender: pilotPlayer.female ? "Cái (Female)" : "Đực (Male)",
+        growth: Math.round((pilotPlayer.growth || 0) * 100),
+        health: Math.round(((pilotPlayer.health || 0) / (pilotPlayer.maxHealth || 1)) * 100) || 100,
+        hunger: Math.round(((pilotPlayer.hunger || 0) / (pilotPlayer.maxHunger || 1)) * 100) || 100,
+        thirst: Math.round(((pilotPlayer.thirst || 0) / (pilotPlayer.maxThirst || 1)) * 100) || 100,
+        stamina: 100,
+        diet: ["S", "S", "D"],
+        isPrimeElder: pilotPlayer.isPrimeElder || false,
+        position: pilotPlayer.position || null,
+        lat: loc.lat,
+        lng: loc.lng,
+        grid: loc.grid
+      };
+    }
+  }
+
+  return {
+    steam_id: steamId,
+    persona_name: persona || `Player_${steamId.slice(-4)}`,
+    avatar: avatar,
+    role: "Thành viên ST25",
+    linked: true,
+    linked_at: new Date().toLocaleString('vi-VN'),
+    playtime_hours: playtime,
+    coins: wallet,
+    discord: discord,
+    dino: dino,
+    created_at: Date.now(),
+    expires_at: Date.now() + 30 * 24 * 60 * 60 * 1000 // 30 ngày
+  };
+}
 
 /* ==================== API ROUTES ==================== */
 
@@ -160,8 +264,11 @@ app.get('/api/server/players', async (req, res) => {
 // 3. Steam OpenID Login URL
 app.get('/api/player/steam/login', (req, res) => {
   const redirect = req.query.redirect || '/lien-ket-steam.html';
-  const host = req.get('host') || `localhost:${PORT}`;
-  const protocol = req.protocol || 'http';
+  const host = req.get('x-forwarded-host') || req.get('host') || 'www.st25.io.vn';
+  const protoHeader = req.get('x-forwarded-proto');
+  const isHttps = req.secure || protoHeader === 'https' || host.includes('st25.io.vn');
+  const protocol = isHttps ? 'https' : 'http';
+
   const returnTo = `${protocol}://${host}/api/player/steam/callback?redirect=${encodeURIComponent(redirect)}`;
   const realm = `${protocol}://${host}`;
 
@@ -178,65 +285,20 @@ app.get('/api/player/steam/callback', async (req, res) => {
 
   if (match && match[1]) {
     const steamId = match[1];
-    await linkPlayerBySteamId(steamId);
+    const token = crypto.randomBytes(32).toString('hex');
+    const sessionData = await createPlayerSession(steamId);
+    sessionData.token = token;
+    userSessions[token] = sessionData;
+    saveSessions();
+
+    const host = req.get('x-forwarded-host') || req.get('host') || '';
+    const isHttps = req.secure || req.get('x-forwarded-proto') === 'https' || host.includes('st25.io.vn');
+    const secureFlag = isHttps ? '; Secure' : '';
+    res.setHeader('Set-Cookie', `st25_session=${token}; Path=/; HttpOnly; Max-Age=2592000; SameSite=Lax${secureFlag}`);
   }
 
   res.redirect(redirect);
 });
-
-// Helper: Link player by SteamID from IslePilot API
-async function linkPlayerBySteamId(steamId, customName = null) {
-  const pilotPlayer = await callIslePilot(`/players/${steamId}`);
-
-  let persona = customName;
-  let dino = null;
-  let avatar = "https://avatars.steamstatic.com/fef49e7fa7e1997310d705b2a6158ff8dc1cdfeb_full.jpg";
-  let discord = null;
-  let playtime = 0;
-  let wallet = 0;
-
-  if (pilotPlayer) {
-    persona = pilotPlayer.name || persona || `Player_${steamId.slice(-4)}`;
-    avatar = pilotPlayer.avatar || avatar;
-    discord = pilotPlayer.discord || null;
-    playtime = Math.round((pilotPlayer.totalPlaySec || 0) / 3600);
-    wallet = (pilotPlayer.wallet && pilotPlayer.wallet.balance) || 0;
-
-    if (pilotPlayer.species) {
-      const loc = posToLatLng(pilotPlayer.position);
-      dino = {
-        species: pilotPlayer.species,
-        gender: pilotPlayer.female ? "Cái (Female)" : "Đực (Male)",
-        growth: Math.round((pilotPlayer.growth || 0) * 100),
-        health: Math.round(((pilotPlayer.health || 0) / (pilotPlayer.maxHealth || 1)) * 100) || 100,
-        hunger: Math.round(((pilotPlayer.hunger || 0) / (pilotPlayer.maxHunger || 1)) * 100) || 100,
-        thirst: Math.round(((pilotPlayer.thirst || 0) / (pilotPlayer.maxThirst || 1)) * 100) || 100,
-        stamina: 100,
-        diet: ["S", "S", "D"],
-        isPrimeElder: pilotPlayer.isPrimeElder || false,
-        position: pilotPlayer.position || null,
-        lat: loc.lat,
-        lng: loc.lng,
-        grid: loc.grid
-      };
-    }
-  }
-
-  currentSession = {
-    steam_id: steamId,
-    persona_name: persona || `Player_${steamId.slice(-4)}`,
-    avatar: avatar,
-    role: "Thành viên ST25",
-    linked: true,
-    linked_at: new Date().toLocaleString('vi-VN'),
-    playtime_hours: playtime,
-    coins: wallet,
-    discord: discord,
-    dino: dino
-  };
-
-  return currentSession;
-}
 
 // 4. Manual Link Disabled - Strictly require official Steam OpenID Login
 app.post('/api/player/link-steam', (req, res) => {
@@ -245,17 +307,19 @@ app.post('/api/player/link-steam', (req, res) => {
   });
 });
 
-// 5. Get Current Player info
+// 5. Get Current Player info (Session riêng biệt của người dùng)
 app.get('/api/player/me', async (req, res) => {
-  const reqSteamId = req.query.steamId || (currentSession && currentSession.steam_id);
+  const user = getUserSession(req);
+  const reqSteamId = (user && user.steam_id) || req.query.steamId;
+
   if (reqSteamId) {
     const pilotPlayer = await callIslePilot(`/players/${reqSteamId}`);
     if (pilotPlayer) {
       const loc = posToLatLng(pilotPlayer.position);
       return res.json({
         steam_id: reqSteamId,
-        persona_name: pilotPlayer.name || (currentSession && currentSession.persona_name) || "Người chơi",
-        avatar: pilotPlayer.avatar || "https://avatars.steamstatic.com/fef49e7fa7e1997310d705b2a6158ff8dc1cdfeb_full.jpg",
+        persona_name: pilotPlayer.name || (user && user.persona_name) || "Người chơi",
+        avatar: pilotPlayer.avatar || (user && user.avatar) || "https://avatars.steamstatic.com/fef49e7fa7e1997310d705b2a6158ff8dc1cdfeb_full.jpg",
         role: "Thành viên ST25",
         linked: true,
         playtime_hours: Math.round((pilotPlayer.totalPlaySec || 0) / 3600),
@@ -271,6 +335,7 @@ app.get('/api/player/me', async (req, res) => {
           hunger: Math.round(((pilotPlayer.hunger || 0) / (pilotPlayer.maxHunger || 1)) * 100) || 100,
           thirst: Math.round(((pilotPlayer.thirst || 0) / (pilotPlayer.maxThirst || 1)) * 100) || 100,
           stamina: 100,
+          diet: ["S", "S", "D"],
           isPrimeElder: pilotPlayer.isPrimeElder || false,
           position: pilotPlayer.position,
           lat: loc.lat,
@@ -279,23 +344,29 @@ app.get('/api/player/me', async (req, res) => {
         }
       });
     }
-  }
-
-  if (currentSession) {
-    return res.json(currentSession);
+    if (user && user.steam_id === reqSteamId) {
+      return res.json(user);
+    }
   }
 
   res.json({ linked: false, persona_name: "Chưa liên kết", avatar: null, coins: 0, balance: 0, lua: 0 });
 });
 
 app.post('/api/player/logout', (req, res) => {
-  currentSession = null;
+  const cookies = parseCookies(req.headers && req.headers.cookie);
+  const token = (cookies && cookies['st25_session']) || (req.headers && req.headers['x-session-token']);
+  if (token && userSessions[token]) {
+    delete userSessions[token];
+    saveSessions();
+  }
+  res.setHeader('Set-Cookie', `st25_session=; Path=/; HttpOnly; Max-Age=0; SameSite=Lax`);
   res.json({ success: true, message: "Đã đăng xuất thành công!" });
 });
 
 // 6. Quests (Nhiệm Vụ Cá Nhân) Endpoint
 app.get('/api/player/quests', async (req, res) => {
-  const steamId = req.query.steamId || (currentSession && currentSession.steam_id);
+  const user = getUserSession(req);
+  const steamId = req.query.steamId || (user && user.steam_id);
   if (!steamId) {
     return res.json({
       steamId: null,
@@ -356,14 +427,14 @@ app.get('/api/player/quests', async (req, res) => {
     }));
   }
 
-  const isCurrentLoggedIn = !!(currentSession && currentSession.steam_id === steamId);
+  const isCurrentLoggedIn = !!(user && user.steam_id === steamId);
 
   res.json({
     steamId,
-    isLoggedIn: isCurrentLoggedIn || !!(currentSession),
+    isLoggedIn: isCurrentLoggedIn || !!(user),
     player: playerDetails ? {
-      name: playerDetails.name || (currentSession && currentSession.persona_name) || "Thành viên ST25",
-      avatar: playerDetails.avatar || (currentSession && currentSession.avatar) || "https://avatars.steamstatic.com/fef49e7fa7e1997310d705b2a6158ff8dc1cdfeb_full.jpg",
+      name: playerDetails.name || (user && user.persona_name) || "Thành viên ST25",
+      avatar: playerDetails.avatar || (user && user.avatar) || "https://avatars.steamstatic.com/fef49e7fa7e1997310d705b2a6158ff8dc1cdfeb_full.jpg",
       species: playerDetails.species || "Chưa chọn loài",
       gender: playerDetails.female ? "Cái (Female)" : "Đực (Male)",
       growth: Math.round((playerDetails.growth || 0) * 100),
@@ -382,7 +453,8 @@ app.get('/api/player/quests', async (req, res) => {
 
 // 7. Live Map Coordinates (Member View - Only show this player, hide others)
 app.get('/api/player/map', async (req, res) => {
-  const reqSteamId = req.query.steamId || (currentSession && currentSession.steam_id);
+  const user = getUserSession(req);
+  const reqSteamId = (user && user.steam_id) || req.query.steamId;
   const onlineData = await callIslePilot('/players?online=true');
   const allOnline = (onlineData && onlineData.players) || [];
 
@@ -449,7 +521,7 @@ app.get('/api/player/map', async (req, res) => {
   res.json({
     online: isOnline,
     steamId: activePlayer ? activePlayer.steamId : reqSteamId,
-    name: (activePlayer && activePlayer.name) || (currentSession && currentSession.persona_name) || "Người chơi",
+    name: (activePlayer && activePlayer.name) || (user && user.persona_name) || "Người chơi",
     species: (activePlayer && activePlayer.species) || "Chưa chọn khủng long",
     gender: (activePlayer && activePlayer.female) ? "Cái (Female)" : "Đực (Male)",
     growth: activePlayer ? `${Math.round((activePlayer.growth || 0) * 100)}%` : "0%",
@@ -484,7 +556,8 @@ app.get('/api/map/zones', (req, res) => {
 
 // 8. Team / Pack Members (Real Data from IslePilot)
 app.get('/api/player/team', async (req, res) => {
-  const reqSteamId = req.query.steamId || (currentSession && currentSession.steam_id) || "76561198636766540";
+  const user = getUserSession(req);
+  const reqSteamId = (user && user.steam_id) || req.query.steamId || "76561198636766540";
   const onlineData = await callIslePilot('/players?online=true');
   const allOnline = (onlineData && onlineData.players) || [];
 
@@ -571,7 +644,8 @@ async function getPlayerGarageStatus(steamId) {
 
 // 9. Garage Endpoints (Live Synchronized with IslePilot & In-Game Plugin)
 app.get('/api/player/garage', async (req, res) => {
-  const steamId = req.query.steamId || (currentSession && currentSession.steam_id);
+  const user = getUserSession(req);
+  const steamId = (user && user.steam_id) || req.query.steamId;
   if (!steamId) {
     const cfg = getConfig();
     const defSlots = (cfg.garage && cfg.garage.default_slots) || 2;
@@ -656,7 +730,7 @@ app.get('/api/player/garage', async (req, res) => {
     slots,
     tradeableDinos,
     steamId,
-    personaName: (pilotPlayer && pilotPlayer.name) || (currentSession && currentSession.persona_name) || "Thành viên ST25",
+    personaName: (pilotPlayer && pilotPlayer.name) || (user && user.persona_name) || "Thành viên ST25",
     totalParked: garageStatus.totalParked,
     maxSlots: garageStatus.maxSlots,
     isFull: garageStatus.isFull,
@@ -666,7 +740,8 @@ app.get('/api/player/garage', async (req, res) => {
 
 app.post('/api/player/garage/store', async (req, res) => {
   const { action } = req.body;
-  const steamId = req.body.steamId || (currentSession && currentSession.steam_id);
+  const user = getUserSession(req);
+  const steamId = (user && user.steam_id) || req.body.steamId;
   if (!steamId) {
     return res.status(401).json({ error: "Vui lòng đăng nhập Steam trước khi dùng Gara!" });
   }
@@ -714,7 +789,8 @@ app.post('/api/player/garage/store', async (req, res) => {
 
 app.post('/api/player/garage/load', async (req, res) => {
   const { id, slot, species, growth } = req.body;
-  const steamId = req.body.steamId || (currentSession && currentSession.steam_id);
+  const user = getUserSession(req);
+  const steamId = (user && user.steam_id) || req.body.steamId;
   if (!steamId) {
     return res.status(401).json({ error: "Vui lòng đăng nhập Steam trước khi dùng Gara!" });
   }
@@ -771,7 +847,8 @@ app.post('/api/player/garage/load', async (req, res) => {
 
 app.post('/api/player/garage/delete', async (req, res) => {
   const { id } = req.body;
-  const steamId = req.body.steamId || (currentSession && currentSession.steam_id);
+  const user = getUserSession(req);
+  const steamId = (user && user.steam_id) || req.body.steamId;
   if (!steamId) {
     return res.status(401).json({ error: "Vui lòng đăng nhập Steam trước khi xoá khủng long!" });
   }
@@ -802,8 +879,16 @@ app.post('/api/player/garage/delete', async (req, res) => {
 app.post('/api/player/session/switch', async (req, res) => {
   const { steamId } = req.body;
   if (!steamId) return res.status(400).json({ error: "Thiếu steamId" });
-  await linkPlayerBySteamId(steamId);
-  res.json({ success: true, session: currentSession });
+  const token = crypto.randomBytes(32).toString('hex');
+  const sessionData = await createPlayerSession(steamId);
+  sessionData.token = token;
+  userSessions[token] = sessionData;
+  saveSessions();
+  const host = req.get('x-forwarded-host') || req.get('host') || '';
+  const isHttps = req.secure || req.get('x-forwarded-proto') === 'https' || host.includes('st25.io.vn');
+  const secureFlag = isHttps ? '; Secure' : '';
+  res.setHeader('Set-Cookie', `st25_session=${token}; Path=/; HttpOnly; Max-Age=2592000; SameSite=Lax${secureFlag}`);
+  res.json({ success: true, session: sessionData });
 });
 
 // Helper: Thêm Dino vào Gara của người chơi
@@ -927,12 +1012,13 @@ async function modifyLivePlayerBalance(steamId, amount, reason = "web_portal") {
 // 10. Chợ Giao Dịch & Ví Lúa (Linked Directly to IslePilot API)
 app.get('/api/market/data', async (req, res) => {
   const data = getPortalData();
-  const steamId = req.query.steamId || (currentSession && currentSession.steam_id);
+  const user = getUserSession(req);
+  const steamId = (user && user.steam_id) || req.query.steamId;
   const userBalance = steamId ? await getLivePlayerBalance(steamId) : 0;
 
   res.json({
     steamId: steamId || null,
-    personaName: (currentSession && currentSession.persona_name) || "Khách (Chưa đăng nhập)",
+    personaName: (user && user.persona_name) || "Khách (Chưa đăng nhập)",
     balance: userBalance,
     listings: data.marketListings,
     inventory: steamId ? (data.userInventory[steamId] || []) : []
@@ -942,7 +1028,8 @@ app.get('/api/market/data', async (req, res) => {
 app.post('/api/market/transfer', async (req, res) => {
   const { receiverSteamId, amount, note } = req.body;
   const data = getPortalData();
-  const senderSteamId = req.body.senderSteamId || (currentSession && currentSession.steam_id);
+  const user = getUserSession(req);
+  const senderSteamId = (user && user.steam_id) || req.body.senderSteamId;
   if (!senderSteamId) {
     return res.status(401).json({ error: "Vui lòng đăng nhập Steam để chuyển Lúa!" });
   }
@@ -973,7 +1060,8 @@ app.post('/api/market/transfer', async (req, res) => {
 app.post('/api/market/buy', async (req, res) => {
   const { itemId } = req.body;
   const data = getPortalData();
-  const steamId = req.body.steamId || (currentSession && currentSession.steam_id);
+  const user = getUserSession(req);
+  const steamId = (user && user.steam_id) || req.body.steamId;
   if (!steamId) {
     return res.status(401).json({ error: "Vui lòng đăng nhập Steam để mua khủng long!" });
   }
@@ -1035,7 +1123,8 @@ app.post('/api/market/buy', async (req, res) => {
 app.post('/api/market/list-dino', async (req, res) => {
   const { dinoId, price, customTitle } = req.body;
   const data = getPortalData();
-  const steamId = req.body.steamId || (currentSession && currentSession.steam_id);
+  const user = getUserSession(req);
+  const steamId = (user && user.steam_id) || req.body.steamId;
   if (!steamId) {
     return res.status(401).json({ error: "Vui lòng đăng nhập Steam để đăng bán khủng long!" });
   }
@@ -1078,7 +1167,7 @@ app.post('/api/market/list-dino', async (req, res) => {
     return res.status(404).json({ error: "Không tìm thấy khủng long này trong Gara của bạn!" });
   }
 
-  const sellerName = (currentSession && currentSession.persona_name) || `Player_${steamId.slice(-4)}`;
+  const sellerName = (user && user.persona_name) || `Player_${steamId.slice(-4)}`;
 
   // Thêm vào danh sách Chợ
   const newListing = {
@@ -1122,7 +1211,8 @@ app.post('/api/market/list-dino', async (req, res) => {
 app.post('/api/market/cancel-listing', async (req, res) => {
   const { listingId } = req.body;
   const data = getPortalData();
-  const steamId = req.body.steamId || (currentSession && currentSession.steam_id);
+  const user = getUserSession(req);
+  const steamId = (user && user.steam_id) || req.body.steamId;
   if (!steamId) {
     return res.status(401).json({ error: "Vui lòng đăng nhập Steam để thu hồi bài bán!" });
   }
@@ -1281,7 +1371,8 @@ const CRATE_TYPES = [
 ];
 
 app.get('/api/crates/list', async (req, res) => {
-  const steamId = req.query.steamId || (currentSession && currentSession.steam_id);
+  const user = getUserSession(req);
+  const steamId = (user && user.steam_id) || req.query.steamId;
   const userBalance = steamId ? await getLivePlayerBalance(steamId) : 0;
   res.json({
     balance: userBalance,
@@ -1294,7 +1385,8 @@ app.post('/api/crates/open', async (req, res) => {
   const crate = CRATE_TYPES.find(c => c.id === crateId);
   if (!crate) return res.status(400).json({ error: "Loại hòm không tồn tại!" });
 
-  const steamId = req.body.steamId || (currentSession && currentSession.steam_id);
+  const user = getUserSession(req);
+  const steamId = (user && user.steam_id) || req.body.steamId;
   if (!steamId) {
     return res.status(401).json({ error: "Vui lòng đăng nhập Steam trước khi mở hòm!" });
   }
@@ -1376,7 +1468,8 @@ app.post('/api/crates/open', async (req, res) => {
 
 // 12. Skin API & Shop (Linked Directly to IslePilot API)
 app.get('/api/skin/info', async (req, res) => {
-  const steamId = req.query.steamId || (currentSession && currentSession.steam_id);
+  const user = getUserSession(req);
+  const steamId = (user && user.steam_id) || req.query.steamId;
   const shopSkins = [
     { id: "skin-gold-trex", name: "Tyrannosaurus Kim Giáp ST25", species: "Tyrannosaurus", price: 20, icon: "🦖" },
     { id: "skin-hw-trex", name: "Tyrannosaurus Halloween Độc Quyền", species: "Tyrannosaurus", price: 20, icon: "🎃" },
@@ -1402,7 +1495,7 @@ app.get('/api/skin/info', async (req, res) => {
 
   res.json({
     steamId,
-    personaName: (pilotPlayer && pilotPlayer.name) || (currentSession && currentSession.persona_name) || "Thành viên ST25",
+    personaName: (pilotPlayer && pilotPlayer.name) || (user && user.persona_name) || "Thành viên ST25",
     species: (pilotPlayer && pilotPlayer.species) || "Tyrannosaurus",
     growth: pilotPlayer ? Math.round((pilotPlayer.growth || 0) * 100) : 100,
     balance: liveBalance,
@@ -1413,7 +1506,8 @@ app.get('/api/skin/info', async (req, res) => {
 
 app.post('/api/skin/apply', async (req, res) => {
   const { species, colors, skinCode } = req.body;
-  const steamId = req.body.steamId || (currentSession && currentSession.steam_id);
+  const user = getUserSession(req);
+  const steamId = (user && user.steam_id) || req.body.steamId;
   if (!steamId) {
     return res.status(401).json({ error: "Vui lòng đăng nhập Steam trước khi áp dụng Skin!" });
   }
@@ -1453,7 +1547,11 @@ app.post('/api/skin/apply', async (req, res) => {
 
 app.post('/api/skin/buy', async (req, res) => {
   const { skinId, skinName, price } = req.body;
-  const steamId = (currentSession && currentSession.steam_id) || "76561198636766540";
+  const user = getUserSession(req);
+  const steamId = (user && user.steam_id) || req.body.steamId;
+  if (!steamId) {
+    return res.status(401).json({ error: "Vui lòng đăng nhập Steam trước khi mua Skin!" });
+  }
   const skinPrice = Number(price) || 20;
 
   const userBal = await getLivePlayerBalance(steamId);
@@ -1545,7 +1643,8 @@ const CARCASS_TYPES = [
 ];
 
 app.get('/api/carcass/types', async (req, res) => {
-  const steamId = req.query.steamId || (currentSession && currentSession.steam_id);
+  const user = getUserSession(req);
+  const steamId = (user && user.steam_id) || req.query.steamId;
   const userBalance = steamId ? await getLivePlayerBalance(steamId) : 0;
   const data = getPortalData();
   const userOrders = steamId ? (data.carcassOrders || []).filter(o => o.steamId === steamId) : [];
@@ -1561,7 +1660,8 @@ app.post('/api/carcass/order', async (req, res) => {
   const carcass = CARCASS_TYPES.find(c => c.id === carcassId);
   if (!carcass) return res.status(400).json({ error: "Loại xác không hợp lệ!" });
 
-  const steamId = req.body.steamId || (currentSession && currentSession.steam_id);
+  const user = getUserSession(req);
+  const steamId = (user && user.steam_id) || req.body.steamId;
   if (!steamId) {
     return res.status(401).json({ error: "Vui lòng đăng nhập Steam để gọi thả xác!" });
   }
@@ -1576,7 +1676,7 @@ app.post('/api/carcass/order', async (req, res) => {
   // 1. Trừ Lúa trực tiếp từ tài khoản qua IslePilot API
   const deductRes = await modifyLivePlayerBalance(steamId, -carcass.price, `Thả xác tiếp tế ${carcass.name}`);
 
-  const playerName = (currentSession && currentSession.persona_name) || `Player_${steamId.slice(-4)}`;
+  const playerName = (user && user.persona_name) || `Player_${steamId.slice(-4)}`;
 
   // 2. KÍCH HOẠT LỆNH THẬT TRÊN MÁY CHỦ ISLEPILOT:
   // - 2.1 LỆNH RỚT XÁC VẬT LÝ THEO ĐÚNG LOÀI & GROWTH TRỰC TIẾP TẠI TỌA ĐỘ NGƯỜI CHƠI
@@ -1635,7 +1735,8 @@ app.post('/api/carcass/order', async (req, res) => {
 
 // 13. Hệ Thống Hỗ Trợ & Cứu Kẹt (Support & Unstuck)
 app.post('/api/support/unstuck', (req, res) => {
-  const steamId = req.body.steamId || (currentSession && currentSession.steam_id);
+  const user = getUserSession(req);
+  const steamId = (user && user.steam_id) || req.body.steamId;
   if (!steamId) {
     return res.status(401).json({ error: "Vui lòng đăng nhập Steam để sử dụng Cứu Kẹt GPS!" });
   }
@@ -1653,7 +1754,8 @@ app.post('/api/support/ticket', (req, res) => {
   }
 
   const data = getPortalData();
-  const steamId = req.body.senderSteamId || (currentSession && currentSession.steam_id) || "Khách ẩn danh";
+  const user = getUserSession(req);
+  const steamId = (user && user.steam_id) || req.body.senderSteamId || "Khách ẩn danh";
 
   const newTicket = {
     id: `TK-${Math.floor(1000 + Math.random() * 9000)}`,
@@ -1680,7 +1782,9 @@ app.post('/api/support/ticket', (req, res) => {
 
 app.get('/api/support/my-tickets', (req, res) => {
   const data = getPortalData();
-  const steamId = (currentSession && currentSession.steam_id) || "76561198636766540";
+  const user = getUserSession(req);
+  const steamId = (user && user.steam_id) || req.query.steamId;
+  if (!steamId) return res.json([]);
   const userTickets = data.tickets.filter(t => t.senderSteamId === steamId);
   res.json(userTickets);
 });
@@ -1688,7 +1792,8 @@ app.get('/api/support/my-tickets', (req, res) => {
 // 14. Mời Bạn Bè (Referral)
 app.get('/api/referral/me', (req, res) => {
   const data = getPortalData();
-  const steamId = req.query.steamId || (currentSession && currentSession.steam_id);
+  const user = getUserSession(req);
+  const steamId = (user && user.steam_id) || req.query.steamId;
   if (!steamId) {
     return res.json({
       referralCode: null,
@@ -1718,7 +1823,8 @@ app.post('/api/referral/claim', (req, res) => {
 
   const cleanCode = code.trim().toUpperCase();
   const data = getPortalData();
-  const steamId = req.body.steamId || (currentSession && currentSession.steam_id);
+  const user = getUserSession(req);
+  const steamId = (user && user.steam_id) || req.body.steamId;
   if (!steamId) {
     return res.status(401).json({ error: "Vui lòng đăng nhập Steam trước khi nhập mã giới thiệu!" });
   }
