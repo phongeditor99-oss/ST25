@@ -339,6 +339,24 @@
         "stored_at": "19:15:03 6/10/2026",
         "source": "Mua từ Chợ Giao Dịch (Raptor Tốc Độ)",
         "isLocal": true
+      },
+      {
+        "id": "dino-1791292834412-376",
+        "species": "Allosaurus",
+        "gender": "Đực (Male)",
+        "growth": 60,
+        "health": 100,
+        "hunger": 100,
+        "thirst": 100,
+        "diet": [
+          "S",
+          "S",
+          "D"
+        ],
+        "mutations": [],
+        "stored_at": "20:20:34 6/10/2026",
+        "source": "Trúng thưởng từ Hòm Halloween Huyền Bí 🎃",
+        "isLocal": true
       }
     ]
   },
@@ -347,5 +365,7 @@
       "cmuwjve0y00axp7015omvmy62",
       "cmuwkxsoo09qjrz01nz42tye5"
     ]
-  }
+  },
+  "playerGarageSlots": {},
+  "playerWallets": {}
 }

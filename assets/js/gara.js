@@ -77,7 +77,8 @@ const Garage = {
           steamId: data.steamId,
           personaName: data.personaName,
           totalParked: data.totalParked || 0,
-          maxSlots: data.maxSlots || 20
+          maxSlots: data.maxSlots || 2,
+          isFull: data.isFull || false
         };
         this.updateHeaderUI();
         return;
@@ -94,11 +95,36 @@ const Garage = {
     const steamEl = document.getElementById('garage-player-steamid');
     const countEl = document.getElementById('garage-count-badge');
     const capEl = document.getElementById('garage-capacity-text');
+    const syncBadge = document.getElementById('garage-sync-badge');
 
-    if (nameEl) nameEl.textContent = `Tài khoản: ${this.playerInfo.personaName}`;
-    if (steamEl) steamEl.textContent = `Steam ID: ${this.playerInfo.steamId}`;
-    if (countEl) countEl.textContent = `Đang lưu: ${this.playerInfo.totalParked} / ${this.playerInfo.maxSlots} Khủng Long`;
-    if (capEl) capEl.textContent = `Sức chứa tối đa: ${this.playerInfo.maxSlots} khủng long (Theo luật server)`;
+    if (nameEl) nameEl.textContent = this.playerInfo.steamId ? `Tài khoản: ${this.playerInfo.personaName}` : `Tài khoản: Khách (Chưa đăng nhập Steam)`;
+    if (steamEl) steamEl.textContent = this.playerInfo.steamId ? `Steam ID: ${this.playerInfo.steamId}` : `Chưa liên kết tài khoản Steam`;
+    
+    if (countEl) {
+      if (this.playerInfo.isFull) {
+        countEl.innerHTML = `⚠️ <span style="color: #ef4444; font-weight: 800;">ĐÃ ĐẦY: ${this.playerInfo.totalParked} / ${this.playerInfo.maxSlots} Khủng Long</span>`;
+      } else {
+        countEl.textContent = `Đang lưu: ${this.playerInfo.totalParked} / ${this.playerInfo.maxSlots} Khủng Long`;
+      }
+    }
+    
+    if (capEl) capEl.textContent = `Sức chứa tối đa: ${this.playerInfo.maxSlots} khủng long (Đồng bộ theo Role Discord)`;
+    
+    if (syncBadge) {
+      if (this.playerInfo.isFull) {
+        syncBadge.className = 'rule-badge badge-deny';
+        syncBadge.style.background = 'rgba(239, 68, 68, 0.15)';
+        syncBadge.style.borderColor = '#ef4444';
+        syncBadge.style.color = '#fca5a5';
+        syncBadge.textContent = '⚠️ GARA ĐÃ ĐẠT GIỚI HẠN ROLE';
+      } else {
+        syncBadge.className = 'rule-badge badge-allow';
+        syncBadge.style.background = 'rgba(16, 185, 129, 0.15)';
+        syncBadge.style.borderColor = '#10b981';
+        syncBadge.style.color = '#6ee7b7';
+        syncBadge.textContent = '✅ ĐÃ ĐỒNG BỘ ISLEPILOT & IN-GAME';
+      }
+    }
   },
 
   render() {
@@ -112,6 +138,16 @@ const Garage = {
     if (!panel) return;
 
     if (!this.activeDino) {
+      if (!this.playerInfo || !this.playerInfo.steamId) {
+        panel.innerHTML = `
+          <div style="grid-column: 1 / -1; text-align: center; padding: 40px; color: var(--text-muted);">
+            <h3 style="color: #fff; margin-bottom: 6px;">Chưa Đăng Nhập Steam</h3>
+            <p style="color: #94a3b8; margin-bottom: 16px;">Vui lòng đăng nhập tài khoản Steam chính chủ để đồng bộ khủng long và kho Gara từ server ST25.</p>
+            <a href="/api/player/steam/login" class="btn btn-primary btn-sm">🔗 Đăng Nhập Bằng Steam</a>
+          </div>
+        `;
+        return;
+      }
       panel.innerHTML = `
         <div style="grid-column: 1 / -1; text-align: center; padding: 40px; color: var(--text-muted);">
           <h3 style="color: #fff; margin-bottom: 6px;">Bạn hiện không có khủng long nào đang chơi (Active)</h3>
@@ -129,9 +165,15 @@ const Garage = {
         <p style="font-size: 0.9rem; color: var(--text-muted); margin-top: 10px;">
           Tăng trưởng: <b style="color: #10b981; font-size: 1.1rem;">${d.growth}%</b>
         </p>
-        <button onclick="Garage.storeActiveDino()" class="btn btn-secondary btn-sm" style="margin-top: 16px; width: 100%; font-weight: 700;">
-          📥 Cất Vào Gara (Park 35s)
-        </button>
+        ${this.playerInfo && this.playerInfo.isFull ? `
+          <button onclick="Garage.storeActiveDino()" class="btn btn-secondary btn-sm" style="margin-top: 16px; width: 100%; font-weight: 700; border-color: #ef4444; color: #fca5a5; background: rgba(239, 68, 68, 0.1);">
+            ⚠️ Gara Đã Đầy (${this.playerInfo.totalParked}/${this.playerInfo.maxSlots})
+          </button>
+        ` : `
+          <button onclick="Garage.storeActiveDino()" class="btn btn-secondary btn-sm" style="margin-top: 16px; width: 100%; font-weight: 700;">
+            📥 Cất Vào Gara (Park 30s)
+          </button>
+        `}
       </div>
 
       <div>
@@ -239,6 +281,11 @@ const Garage = {
       return;
     }
 
+    if (this.playerInfo && this.playerInfo.isFull) {
+      alert(`⚠️ GARA CỦA BẠN ĐÃ ĐẦY (${this.playerInfo.totalParked}/${this.playerInfo.maxSlots} slot)!\n\nBạn đã đạt giới hạn sức chứa Gara theo Role Discord trên server ST25.\nKhông thể cất thêm khủng long vào kho!\n\nVui lòng lấy bớt khủng long ra chơi, bán bớt hoặc liên hệ Admin Discord (https://discord.gg/3xCrA6VyY) để nâng cấp Gara!`);
+      return;
+    }
+
     if (this.parkingSeconds > 0) {
       App.showToast(`Đang trong tiến trình cất thú (${this.parkingSeconds}s còn lại). Vui lòng đứng yên!`, 'warning');
       return;
@@ -249,13 +296,19 @@ const Garage = {
     }
 
     try {
-      App.showToast('Bắt đầu đếm ngược 30 giây cất thú. Vui lòng đứng yên trong game! ⏳', 'info');
       const startRes = await fetch('/api/player/garage/store', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action: 'start' })
       });
 
+      if (!startRes.ok) {
+        const errData = await startRes.json();
+        alert(`⚠️ KHÔNG THỂ CẤT VÀO GARA:\n\n${errData.error || 'Gara của bạn đã đầy!'}`);
+        return;
+      }
+
+      App.showToast('Bắt đầu đếm ngược 30 giây cất thú. Vui lòng đứng yên trong game! ⏳', 'info');
       this.parkingSeconds = 30;
       this.updateParkingUI();
 
